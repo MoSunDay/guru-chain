@@ -32,6 +32,13 @@ var (
 	jsonFlag       = flag.Bool("json", false, "emit output in JSON format")
 	reflectFlag    = flag.Bool("reflect", false, "analyze reflection soundly (slow)")
 	cpuprofileFlag = flag.String("cpuprofile", "", "write CPU profile to `file`")
+
+	// func-chain specific flags
+	depthFlag        = flag.Int("depth", 30, "maximum call chain depth for func-chain query")
+	skipStdlibFlag   = flag.Bool("skip-stdlib", false, "skip standard library functions in func-chain analysis")
+	localOnlyFlag    = flag.Bool("local-only", false, "only analyze functions within the current module")
+	externalOnlyFlag = flag.Bool("external-only", false, "only analyze functions outside the current module")
+	cacheDirFlag     = flag.String("cache-dir", "", "cache directory for func-chain results")
 )
 
 func init() {
@@ -59,6 +66,7 @@ The mode argument determines the query to perform:
 	definition	show declaration of selected identifier
 	describe  	describe selected syntax: definition, methods, etc
 	freevars  	show free variables of selection
+	func-chain	show recursive call chain of selected function
 	implements	show 'implements' relation for selected type or method
 	peers     	show send/receive corresponding to selected channel op
 	referrers 	show all refs to entity denoted by selected identifier
@@ -69,6 +77,18 @@ of the syntax element to query.  For example:
 
 	foo.go:#123,#128
 	bar.go:#123
+
+For func-chain mode, you can also specify a function name directly:
+
+	foo.go:FunctionName
+	foo.go:(*Type).MethodName
+
+func-chain specific flags:
+	-depth N        maximum call chain depth (default: 30)
+	-skip-stdlib    skip standard library functions in analysis
+	-local-only     only analyze functions within the current module
+	-external-only  only analyze functions outside the current module
+	-cache-dir DIR  cache directory for results (repo/file/line based)
 
 The -json flag causes guru to emit output in JSON format;
 	golang.org/x/tools/cmd/guru/serial defines its schema.

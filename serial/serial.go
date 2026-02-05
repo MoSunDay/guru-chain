@@ -249,3 +249,18 @@ type WhichErrsType struct {
 	Type     string `json:"type,omitempty"`
 	Position string `json:"position,omitempty"`
 }
+
+// A FuncChain is the result of a 'func-chain' query.
+// It describes a function and its recursive call chain.
+type FuncChain struct {
+	Name        string       `json:"name"`                   // function name
+	FullName    string       `json:"fullname"`               // full qualified name (package.name)
+	Params      string       `json:"params"`                 // parameters
+	Results     string       `json:"results,omitempty"`      // return values
+	File        string       `json:"file,omitempty"`         // definition file
+	Line        int          `json:"line,omitempty"`         // definition line number
+	Cyclic      bool         `json:"cyclic,omitempty"`       // true if this is a cyclic reference
+	DepthExceed bool         `json:"depth_exceed,omitempty"` // true if max depth exceeded
+	Skipped     bool         `json:"skipped,omitempty"`      // true if skipped (e.g., stdlib)
+	CalledFuncs []*FuncChain `json:"called_funcs,omitempty"` // called functions
+}

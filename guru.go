@@ -86,6 +86,8 @@ func Run(mode string, q *Query) error {
 		return referrers(q)
 	case "what":
 		return what(q)
+	case "func-chain":
+		return funcChain(q)
 	case "callees", "callers", "pointsto", "whicherrs", "callstack", "peers":
 		return fmt.Errorf("mode %q is no longer supported (see Go issue #59676)", mode)
 	default:
