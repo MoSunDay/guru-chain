@@ -18,14 +18,15 @@ import (
 
 // funcChainConfig holds configuration for func-chain analysis
 type funcChainConfig struct {
-	maxDepth     int
-	skipStdlib   bool
-	localOnly    bool   // only analyze functions within the current module
-	externalOnly bool   // only analyze functions outside the current module
-	modulePath   string // current module path (e.g., "github.com/user/repo")
-	cache        *funcChainCache
-	lprog        *loader.Program
-	visited      map[string]bool
+	maxDepth      int
+	skipStdlib    bool
+	localOnly     bool   // only analyze functions within the current module
+	externalOnly  bool   // only analyze functions outside the current module
+	externalBrief bool   // only show function name for external calls (no file/line)
+	modulePath    string // current module path (e.g., "github.com/user/repo")
+	cache         *funcChainCache
+	lprog         *loader.Program
+	visited       map[string]bool
 }
 
 // funcChain recursively analyzes the call chain of a function.
@@ -82,13 +83,26 @@ func funcChain(q *Query) error {
 		return fmt.Errorf("cannot find function object for %s", funcDecl.Name.Name)
 	}
 
+	// Get file path for cache info
+	funcPos := lprog.Fset.Position(funcDecl.Pos())
+	filePath := funcPos.Filename
+
+	// Get package path
+	pkgPath := ""
+	if funcObj.Pkg() != nil {
+		pkgPath = funcObj.Pkg().Path()
+	}
+
+	// Get git info for caching
+	gitURL, commitID := getPackageGitInfo(pkgPath, filePath)
+
 	// Initialize cache
 	cache := newFuncChainCache(*cacheDirFlag)
 
 	// Check cache first
 	if cache != nil {
-		cacheKey := cache.getCacheKey(lprog.Fset, funcDecl)
-		if cached := cache.load(cacheKey); cached != nil {
+		cacheKey := cache.getCacheKey(funcDecl)
+		if cached := cache.load(gitURL, commitID, pkgPath, cacheKey); cached != nil {
 			// Return cached result as funcChainResult
 			q.Output(lprog.Fset, serialToResult(cached))
 			return nil
@@ -97,38 +111,39 @@ func funcChain(q *Query) error {
 
 	// Get module path for local/external filtering
 	var modulePath string
-	if *localOnlyFlag || *externalOnlyFlag {
+	if *localOnlyFlag || *externalOnlyFlag || *externalBriefFlag {
 		// Extract directory from position
-		filePath := pos
+		posFilePath := pos
 		if idx := strings.LastIndex(pos, ":#"); idx != -1 {
-			filePath = pos[:idx]
+			posFilePath = pos[:idx]
 		}
-		if !filepath.IsAbs(filePath) {
+		if !filepath.IsAbs(posFilePath) {
 			wd, _ := os.Getwd()
-			filePath = filepath.Join(wd, filePath)
+			posFilePath = filepath.Join(wd, posFilePath)
 		}
-		modulePath = getModulePath(filepath.Dir(filePath))
+		modulePath = getModulePath(filepath.Dir(posFilePath))
 	}
 
 	// Initialize config
 	cfg := &funcChainConfig{
-		maxDepth:     *depthFlag,
-		skipStdlib:   *skipStdlibFlag,
-		localOnly:    *localOnlyFlag,
-		externalOnly: *externalOnlyFlag,
-		modulePath:   modulePath,
-		cache:        cache,
-		lprog:        lprog,
-		visited:      make(map[string]bool),
+		maxDepth:      *depthFlag,
+		skipStdlib:    *skipStdlibFlag,
+		localOnly:     *localOnlyFlag,
+		externalOnly:  *externalOnlyFlag,
+		externalBrief: *externalBriefFlag,
+		modulePath:    modulePath,
+		cache:         cache,
+		lprog:         lprog,
+		visited:       make(map[string]bool),
 	}
 
 	result := cfg.analyzeFuncChain(info, funcDecl, funcObj, 0)
 
 	// Save to cache
 	if cache != nil {
-		cacheKey := cache.getCacheKey(lprog.Fset, funcDecl)
+		cacheKey := cache.getCacheKey(funcDecl)
 		serialResult := result.toSerial(lprog.Fset)
-		cache.save(cacheKey, serialResult)
+		cache.save(gitURL, commitID, pkgPath, cacheKey, serialResult)
 	}
 
 	q.Output(lprog.Fset, result)
@@ -289,6 +304,20 @@ func (cfg *funcChainConfig) extractCalledFunc(info *loader.PackageInfo, call *as
 		pkgPath := funcObj.Pkg().Path()
 		if isLocalPackage(pkgPath, cfg.modulePath) {
 			return nil
+		}
+	}
+
+	// Check if this is an external function (not in local module)
+	isExternal := funcObj.Pkg() != nil && !isLocalPackage(funcObj.Pkg().Path(), cfg.modulePath)
+
+	// For external functions with externalBrief, return minimal info without file/line
+	if cfg.externalBrief && isExternal {
+		return &funcChainResult{
+			Name:     funcObj.Name(),
+			FullName: funcKey,
+			Params:   formatParams(funcType.Params()),
+			Results:  formatResults(funcType.Results()),
+			// Pos is intentionally not set - will result in empty file/line in output
 		}
 	}
 

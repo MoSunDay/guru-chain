@@ -5,13 +5,9 @@
 package main
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"go/ast"
-	"go/printer"
-	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,10 +17,17 @@ import (
 	"golang.org/x/tools/go/loader"
 )
 
-// funcChainCache manages caching of func-chain analysis results
+// packageCacheMeta stores all function analysis results for a package
+type packageCacheMeta struct {
+	GitURL   string                       `json:"git_url"`
+	CommitID string                       `json:"commit_id"`
+	PkgPath  string                       `json:"pkg_path"`
+	Funcs    map[string]*serial.FuncChain `json:"funcs"` // key: funcName
+}
+
+// funcChainCache manages caching of func-chain analysis results at package level
 type funcChainCache struct {
 	cacheDir string
-	repoRoot string
 }
 
 // newFuncChainCache creates a new cache instance
@@ -32,91 +35,151 @@ func newFuncChainCache(cacheDir string) *funcChainCache {
 	if cacheDir == "" {
 		return nil
 	}
-	repoRoot := getRepoRoot()
 	return &funcChainCache{
 		cacheDir: cacheDir,
-		repoRoot: repoRoot,
 	}
 }
 
-// getRepoRoot returns the git repository root or current directory
-func getRepoRoot() string {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+// getGitRemoteURL returns the git remote origin URL for a directory
+func getGitRemoteURL(dir string) string {
+	cmd := exec.Command("git", "-C", dir, "remote", "get-url", "origin")
 	out, err := cmd.Output()
 	if err != nil {
-		wd, _ := os.Getwd()
-		return wd
+		return ""
+	}
+	url := strings.TrimSpace(string(out))
+	// Normalize git URL: remove .git suffix, convert ssh to https format for consistency
+	url = strings.TrimSuffix(url, ".git")
+	if strings.HasPrefix(url, "git@") {
+		// Convert git@github.com:user/repo to github.com/user/repo
+		url = strings.TrimPrefix(url, "git@")
+		url = strings.Replace(url, ":", "/", 1)
+	}
+	if strings.HasPrefix(url, "https://") {
+		url = strings.TrimPrefix(url, "https://")
+	}
+	if strings.HasPrefix(url, "http://") {
+		url = strings.TrimPrefix(url, "http://")
+	}
+	return url
+}
+
+// getGitCommitID returns the current git commit ID for a directory
+func getGitCommitID(dir string) string {
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
 	}
 	return strings.TrimSpace(string(out))
 }
 
-// getCacheKey generates a cache key based on repo + file + funcName + content MD5
-func (c *funcChainCache) getCacheKey(fset *token.FileSet, funcDecl *ast.FuncDecl) string {
-	// Get file path relative to repo root
-	pos := fset.Position(funcDecl.Pos())
-	relPath, err := filepath.Rel(c.repoRoot, pos.Filename)
-	if err != nil {
-		relPath = pos.Filename
+// getPackageGitInfo returns git URL and commit ID for a package path
+// For external packages in go mod cache, extracts version from path
+func getPackageGitInfo(pkgPath string, filePath string) (gitURL, commitID string) {
+	// Get the directory containing the file
+	dir := filepath.Dir(filePath)
+
+	// Check if this is in go mod cache (contains @version)
+	if strings.Contains(filePath, "@") {
+		// External package in module cache: /go/pkg/mod/github.com/user/repo@v1.2.3/...
+		// Extract git URL and version from path
+		parts := strings.Split(filePath, "@")
+		if len(parts) >= 2 {
+			// parts[0] might be like /Users/.../go/pkg/mod/github.com/user/repo
+			modPath := parts[0]
+			// Find the module path part (github.com/user/repo)
+			if idx := strings.Index(modPath, "pkg/mod/"); idx != -1 {
+				gitURL = modPath[idx+8:] // skip "pkg/mod/"
+			}
+			// parts[1] is version@... or version/subpath
+			version := parts[1]
+			if idx := strings.Index(version, "/"); idx != -1 {
+				version = version[:idx]
+			}
+			commitID = version // Use version as commit ID for external deps
+		}
+		return gitURL, commitID
 	}
 
-	// Get function name (including receiver for methods)
+	// Local package: get actual git info
+	gitURL = getGitRemoteURL(dir)
+	commitID = getGitCommitID(dir)
+	return gitURL, commitID
+}
+
+// getCacheKey generates cache key: funcName (including receiver for methods)
+func (c *funcChainCache) getCacheKey(funcDecl *ast.FuncDecl) string {
 	funcName := funcDecl.Name.Name
 	if funcDecl.Recv != nil && len(funcDecl.Recv.List) > 0 {
 		recvType := exprToString(funcDecl.Recv.List[0].Type)
 		funcName = fmt.Sprintf("(%s).%s", recvType, funcName)
 	}
-
-	// Calculate MD5 of function body
-	bodyHash := ""
-	if funcDecl.Body != nil {
-		var buf strings.Builder
-		printer.Fprint(&buf, fset, funcDecl.Body)
-		hash := md5.Sum([]byte(buf.String()))
-		bodyHash = hex.EncodeToString(hash[:])
-	}
-
-	// Build cache key
-	repoName := filepath.Base(c.repoRoot)
-	return fmt.Sprintf("%s/%s/%s/%s", repoName, relPath, funcName, bodyHash)
+	return funcName
 }
 
-// getCachePath returns the full path to the cache file
-func (c *funcChainCache) getCachePath(key string) string {
-	// Sanitize the key for filesystem
-	safeKey := strings.ReplaceAll(key, "/", "_")
-	safeKey = strings.ReplaceAll(safeKey, "(", "_")
-	safeKey = strings.ReplaceAll(safeKey, ")", "_")
-	safeKey = strings.ReplaceAll(safeKey, "*", "ptr_")
-	return filepath.Join(c.cacheDir, safeKey+".json")
+// getCachePath returns the full path to the cache meta.json file
+// Format: <cache_dir>/<safe_git_url>/<commit_id>/<pkg_path>/meta.json
+func (c *funcChainCache) getCachePath(gitURL, commitID, pkgPath string) string {
+	// Sanitize components for filesystem
+	safeGitURL := strings.ReplaceAll(gitURL, "/", "_")
+	safeGitURL = strings.ReplaceAll(safeGitURL, ":", "_")
+	safePkgPath := strings.ReplaceAll(pkgPath, "/", "_")
+	return filepath.Join(c.cacheDir, safeGitURL, commitID, safePkgPath, "meta.json")
 }
 
-// load tries to load a cached result
-func (c *funcChainCache) load(key string) *serial.FuncChain {
-	if c == nil {
+// loadPackageCache loads the entire package cache
+func (c *funcChainCache) loadPackageCache(gitURL, commitID, pkgPath string) *packageCacheMeta {
+	if c == nil || gitURL == "" || commitID == "" {
 		return nil
 	}
-	path := c.getCachePath(key)
+	path := c.getCachePath(gitURL, commitID, pkgPath)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
-	var result serial.FuncChain
-	if err := json.Unmarshal(data, &result); err != nil {
+	var meta packageCacheMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil
 	}
-	return &result
+	return &meta
 }
 
-// save stores a result in the cache
-func (c *funcChainCache) save(key string, result *serial.FuncChain) error {
-	if c == nil {
+// load tries to load a cached result for a specific function
+func (c *funcChainCache) load(gitURL, commitID, pkgPath, funcKey string) *serial.FuncChain {
+	meta := c.loadPackageCache(gitURL, commitID, pkgPath)
+	if meta == nil || meta.Funcs == nil {
 		return nil
 	}
-	path := c.getCachePath(key)
+	return meta.Funcs[funcKey]
+}
+
+// save stores a function result in the package cache
+func (c *funcChainCache) save(gitURL, commitID, pkgPath, funcKey string, result *serial.FuncChain) error {
+	if c == nil || gitURL == "" || commitID == "" {
+		return nil
+	}
+
+	// Load existing cache or create new
+	meta := c.loadPackageCache(gitURL, commitID, pkgPath)
+	if meta == nil {
+		meta = &packageCacheMeta{
+			GitURL:   gitURL,
+			CommitID: commitID,
+			PkgPath:  pkgPath,
+			Funcs:    make(map[string]*serial.FuncChain),
+		}
+	}
+
+	// Add/update function result
+	meta.Funcs[funcKey] = result
+
+	// Write back
+	path := c.getCachePath(gitURL, commitID, pkgPath)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(result, "", "  ")
+	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}

@@ -34,11 +34,12 @@ var (
 	cpuprofileFlag = flag.String("cpuprofile", "", "write CPU profile to `file`")
 
 	// func-chain specific flags
-	depthFlag        = flag.Int("depth", 30, "maximum call chain depth for func-chain query")
-	skipStdlibFlag   = flag.Bool("skip-stdlib", false, "skip standard library functions in func-chain analysis")
-	localOnlyFlag    = flag.Bool("local-only", false, "only analyze functions within the current module")
-	externalOnlyFlag = flag.Bool("external-only", false, "only analyze functions outside the current module")
-	cacheDirFlag     = flag.String("cache-dir", "", "cache directory for func-chain results")
+	depthFlag         = flag.Int("depth", 30, "maximum call chain depth for func-chain query")
+	skipStdlibFlag    = flag.Bool("skip-stdlib", false, "skip standard library functions in func-chain analysis")
+	localOnlyFlag     = flag.Bool("local-only", false, "only analyze functions within the current module")
+	externalOnlyFlag  = flag.Bool("external-only", false, "only analyze functions outside the current module")
+	cacheDirFlag      = flag.String("cache-dir", "", "cache directory for func-chain results")
+	externalBriefFlag = flag.Bool("external-brief", false, "only show function name for external calls, without file/line info")
 )
 
 func init() {
@@ -84,11 +85,12 @@ For func-chain mode, you can also specify a function name directly:
 	foo.go:(*Type).MethodName
 
 func-chain specific flags:
-	-depth N        maximum call chain depth (default: 30)
-	-skip-stdlib    skip standard library functions in analysis
-	-local-only     only analyze functions within the current module
-	-external-only  only analyze functions outside the current module
-	-cache-dir DIR  cache directory for results (repo/file/line based)
+	-depth N         maximum call chain depth (default: 30)
+	-skip-stdlib     skip standard library functions in analysis
+	-local-only      only analyze functions within the current module
+	-external-only   only analyze functions outside the current module
+	-external-brief  only show function name for external calls (no file/line)
+	-cache-dir DIR   cache directory for results (repo/file/line based)
 
 The -json flag causes guru to emit output in JSON format;
 	golang.org/x/tools/cmd/guru/serial defines its schema.
