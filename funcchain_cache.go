@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"golang.org/x/tools/cmd/guru/serial"
+	"golang.org/x/tools/go/loader"
 )
 
 // funcChainCache manages caching of func-chain analysis results
@@ -134,4 +135,69 @@ func exprToString(expr ast.Expr) string {
 	default:
 		return "unknown"
 	}
+}
+
+// importQueryPackageForFuncChain is similar to importQueryPackage but loads all Go files
+// in the directory when the package cannot be found in GOPATH. This ensures that
+// function calls to functions in other files of the same package are properly resolved.
+func importQueryPackageForFuncChain(pos string, conf *loader.Config) (string, error) {
+	fqpos, err := fastQueryPos(conf.Build, pos)
+	if err != nil {
+		return "", err
+	}
+	filename := fqpos.fset.File(fqpos.start).Name()
+
+	_, importPath, err := guessImportPath(filename, conf.Build)
+	if err != nil {
+		// Can't find GOPATH dir.
+		// Load all Go files in the directory as a single package
+		importPath = "command-line-arguments"
+		dir := filepath.Dir(filename)
+
+		// Find all Go files in the directory (excluding test files)
+		goFiles, err := filepath.Glob(filepath.Join(dir, "*.go"))
+		if err != nil {
+			goFiles = []string{filename}
+		}
+
+		// Filter out test files
+		var srcFiles []string
+		for _, f := range goFiles {
+			base := filepath.Base(f)
+			if !strings.HasSuffix(base, "_test.go") {
+				srcFiles = append(srcFiles, f)
+			}
+		}
+
+		if len(srcFiles) == 0 {
+			srcFiles = []string{filename}
+		}
+
+		conf.CreateFromFilenames(importPath, srcFiles...)
+	} else {
+		// Check that it's possible to load the queried package.
+		cfg2 := *conf.Build
+		cfg2.CgoEnabled = false
+		bp, err := cfg2.Import(importPath, "", 0)
+		if err != nil {
+			return "", err
+		}
+
+		switch pkgContainsFile(bp, filename) {
+		case 'T':
+			conf.ImportWithTests(importPath)
+		case 'X':
+			conf.ImportWithTests(importPath)
+			importPath += "_test"
+		case 'G':
+			conf.Import(importPath)
+		default:
+			return "", fmt.Errorf("package %q doesn't contain file %s",
+				importPath, filename)
+		}
+	}
+
+	conf.TypeCheckFuncBodies = func(p string) bool { return p == importPath }
+
+	return importPath, nil
 }

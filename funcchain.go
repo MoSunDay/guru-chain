@@ -196,7 +196,11 @@ func isLocalPackage(pkgPath, modulePath string) bool {
 func (cfg *funcChainConfig) analyzeFuncChain(info *loader.PackageInfo, funcDecl *ast.FuncDecl, funcObj types.Object, depth int) *funcChainResult {
 	funcKey := funcObj.Pkg().Path() + "." + funcObj.Name()
 	if funcDecl.Recv != nil {
-		funcKey = funcObj.Pkg().Path() + "." + funcObj.Type().String()
+		// For methods, include the receiver type in the key
+		if sig, ok := funcObj.Type().(*types.Signature); ok && sig.Recv() != nil {
+			recvTypeName := getReceiverTypeName(sig.Recv().Type())
+			funcKey = funcObj.Pkg().Path() + ".(" + recvTypeName + ")." + funcObj.Name()
+		}
 	}
 
 	// Mark as visited
@@ -312,6 +316,11 @@ func (cfg *funcChainConfig) extractCalledFunc(info *loader.PackageInfo, call *as
 		}
 	}
 
+	// Check if this is an interface method call
+	if recvType, isIface := isInterfaceMethod(info, call); isIface {
+		return cfg.handleInterfaceMethodCall(info, call, funcObj, funcType, funcKey, recvType, depth)
+	}
+
 	// Find function declaration for recursive analysis
 	funcDecl := findFuncDecl(cfg.lprog, funcObj)
 	if funcDecl != nil {
@@ -329,6 +338,123 @@ func (cfg *funcChainConfig) extractCalledFunc(info *loader.PackageInfo, call *as
 		Results:  formatResults(funcType.Results()),
 		Pos:      funcObj.Pos(),
 	}
+}
+
+// handleInterfaceMethodCall handles method calls on interface types by finding all implementations
+func (cfg *funcChainConfig) handleInterfaceMethodCall(
+	info *loader.PackageInfo,
+	call *ast.CallExpr,
+	funcObj types.Object,
+	funcType *types.Signature,
+	funcKey string,
+	ifaceType types.Type,
+	depth int,
+) *funcChainResult {
+	methodName := funcObj.Name()
+	methodPkg := funcObj.Pkg()
+
+	// Create the base result for the interface method
+	result := &funcChainResult{
+		Name:        methodName,
+		FullName:    funcKey,
+		Params:      formatParams(funcType.Params()),
+		Results:     formatResults(funcType.Results()),
+		Pos:         funcObj.Pos(),
+		IsInterface: true,
+	}
+
+	// Find all implementations
+	implementations := cfg.findInterfaceImplementations(ifaceType)
+	if len(implementations) == 0 {
+		return result
+	}
+
+	// For each implementation, find and analyze the corresponding method
+	var implResults []*funcChainResult
+	for _, implType := range implementations {
+		method := cfg.findMethodOnType(implType, methodName, methodPkg)
+		if method == nil {
+			continue
+		}
+
+		// Apply the same filtering as regular functions
+		if method.Pkg() != nil {
+			pkgPath := method.Pkg().Path()
+			// Check skip stdlib
+			if cfg.skipStdlib && isStdlib(pkgPath) {
+				continue
+			}
+			// Check local-only
+			if cfg.localOnly && !isLocalPackage(pkgPath, cfg.modulePath) {
+				continue
+			}
+			// Check external-only
+			if cfg.externalOnly && isLocalPackage(pkgPath, cfg.modulePath) {
+				continue
+			}
+		}
+
+		// Build the full name for the implementation method
+		// Get the receiver type name from the method signature
+		recvTypeName := getReceiverTypeName(implType)
+		var implFullName string
+		if method.Pkg() != nil {
+			implFullName = method.Pkg().Path() + ".(" + recvTypeName + ")." + methodName
+		} else {
+			implFullName = "(" + recvTypeName + ")." + methodName
+		}
+
+		// Check max depth for implementation
+		if depth >= cfg.maxDepth {
+			implResults = append(implResults, &funcChainResult{
+				Name:        methodName,
+				FullName:    implFullName,
+				Params:      formatParams(funcType.Params()),
+				Results:     formatResults(funcType.Results()),
+				Pos:         method.Pos(),
+				DepthExceed: true,
+			})
+			continue
+		}
+
+		// Check if already visited (avoid cycles)
+		if cfg.visited[implFullName] {
+			implResults = append(implResults, &funcChainResult{
+				Name:     methodName,
+				FullName: implFullName,
+				Params:   formatParams(funcType.Params()),
+				Results:  formatResults(funcType.Results()),
+				Pos:      method.Pos(),
+				Cyclic:   true,
+			})
+			continue
+		}
+
+		// Find and analyze the method declaration
+		funcDecl := findFuncDecl(cfg.lprog, method)
+		if funcDecl != nil {
+			pkgInfo := findPackageInfo(cfg.lprog, method)
+			if pkgInfo != nil {
+				implResult := cfg.analyzeFuncChain(pkgInfo, funcDecl, method, depth)
+				if implResult != nil {
+					implResults = append(implResults, implResult)
+				}
+				continue
+			}
+		}
+
+		// External implementation (no source available)
+		implResults = append(implResults, &funcChainResult{
+			Name:     methodName,
+			FullName: implFullName,
+			Params:   formatParams(funcType.Params()),
+			Results:  formatResults(funcType.Results()),
+			Pos:      method.Pos(),
+		})
+	}
+
+	result.Implementations = implResults
+	return result
 }
 
 // findFuncDecl finds the function declaration for a given function object
@@ -358,6 +484,93 @@ func findPackageInfo(lprog *loader.Program, funcObj types.Object) *loader.Packag
 		return nil
 	}
 	return lprog.AllPackages[funcObj.Pkg()]
+}
+
+// isInterfaceMethod checks if a method is called on an interface type
+func isInterfaceMethod(info *loader.PackageInfo, call *ast.CallExpr) (recvType types.Type, isIface bool) {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil, false
+	}
+
+	// Get the type of the receiver expression (X in X.Method())
+	tv, ok := info.Types[sel.X]
+	if !ok {
+		return nil, false
+	}
+
+	recvType = tv.Type
+	return recvType, types.IsInterface(recvType)
+}
+
+// getReceiverTypeName returns a human-readable name for a receiver type
+func getReceiverTypeName(t types.Type) string {
+	// Handle pointer types
+	if ptr, ok := t.(*types.Pointer); ok {
+		return "*" + getReceiverTypeName(ptr.Elem())
+	}
+	// Handle named types
+	if named, ok := t.(*types.Named); ok {
+		obj := named.Obj()
+		if obj.Pkg() != nil {
+			return obj.Name()
+		}
+		return obj.Name()
+	}
+	// Fallback to string representation
+	return t.String()
+}
+
+// findInterfaceImplementations finds all concrete types that implement the given interface
+func (cfg *funcChainConfig) findInterfaceImplementations(ifaceType types.Type) []types.Type {
+	var implementations []types.Type
+
+	// Iterate over all named types in all loaded packages
+	for _, info := range cfg.lprog.AllPackages {
+		for _, obj := range info.Defs {
+			tn, ok := obj.(*types.TypeName)
+			if !ok {
+				continue
+			}
+			named, ok := tn.Type().(*types.Named)
+			if !ok {
+				continue
+			}
+			// Skip interfaces
+			if types.IsInterface(named) {
+				continue
+			}
+
+			// Check if this type implements the interface
+			if types.AssignableTo(named, ifaceType) {
+				implementations = append(implementations, named)
+			} else if pT := types.NewPointer(named); types.AssignableTo(pT, ifaceType) {
+				implementations = append(implementations, pT)
+			}
+		}
+	}
+
+	return implementations
+}
+
+// findMethodOnType finds a method with the given name on the given type
+func (cfg *funcChainConfig) findMethodOnType(t types.Type, methodName string, methodPkg *types.Package) *types.Func {
+	mset := types.NewMethodSet(t)
+	for i := 0; i < mset.Len(); i++ {
+		sel := mset.At(i)
+		fn, ok := sel.Obj().(*types.Func)
+		if !ok {
+			continue
+		}
+		// Match method name and package
+		if fn.Name() == methodName {
+			// For exported methods, package doesn't matter
+			if fn.Exported() || fn.Pkg() == methodPkg {
+				return fn
+			}
+		}
+	}
+	return nil
 }
 
 // formatParams formats the parameters of a function signature
@@ -473,69 +686,4 @@ func matchFuncName(fd *ast.FuncDecl, name string) bool {
 	}
 
 	return false
-}
-
-// importQueryPackageForFuncChain is similar to importQueryPackage but loads all Go files
-// in the directory when the package cannot be found in GOPATH. This ensures that
-// function calls to functions in other files of the same package are properly resolved.
-func importQueryPackageForFuncChain(pos string, conf *loader.Config) (string, error) {
-	fqpos, err := fastQueryPos(conf.Build, pos)
-	if err != nil {
-		return "", err
-	}
-	filename := fqpos.fset.File(fqpos.start).Name()
-
-	_, importPath, err := guessImportPath(filename, conf.Build)
-	if err != nil {
-		// Can't find GOPATH dir.
-		// Load all Go files in the directory as a single package
-		importPath = "command-line-arguments"
-		dir := filepath.Dir(filename)
-
-		// Find all Go files in the directory (excluding test files)
-		goFiles, err := filepath.Glob(filepath.Join(dir, "*.go"))
-		if err != nil {
-			goFiles = []string{filename}
-		}
-
-		// Filter out test files
-		var srcFiles []string
-		for _, f := range goFiles {
-			base := filepath.Base(f)
-			if !strings.HasSuffix(base, "_test.go") {
-				srcFiles = append(srcFiles, f)
-			}
-		}
-
-		if len(srcFiles) == 0 {
-			srcFiles = []string{filename}
-		}
-
-		conf.CreateFromFilenames(importPath, srcFiles...)
-	} else {
-		// Check that it's possible to load the queried package.
-		cfg2 := *conf.Build
-		cfg2.CgoEnabled = false
-		bp, err := cfg2.Import(importPath, "", 0)
-		if err != nil {
-			return "", err
-		}
-
-		switch pkgContainsFile(bp, filename) {
-		case 'T':
-			conf.ImportWithTests(importPath)
-		case 'X':
-			conf.ImportWithTests(importPath)
-			importPath += "_test"
-		case 'G':
-			conf.Import(importPath)
-		default:
-			return "", fmt.Errorf("package %q doesn't contain file %s",
-				importPath, filename)
-		}
-	}
-
-	conf.TypeCheckFuncBodies = func(p string) bool { return p == importPath }
-
-	return importPath, nil
 }
